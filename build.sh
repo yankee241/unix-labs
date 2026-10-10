@@ -14,34 +14,36 @@ if [ ! -f "$SRC_FILE" ]; then
     exit 1
 fi
 
-# 1. Ищем имя конечного файла в строке с "Output:"
-OUT_NAME=$(grep -m 1 "Output:" "$SRC_FILE" | sed -n 's/.*Output:[ \t]*//p' | tr -d '\r')
+# 1. Ищем имя конечного файла строго по стандарту POSIX (без grep -m 1 и \t)
+OUT_NAME=$(sed -n '/Output:/ { s/.*Output:[[:space:]]*//p; q; }' "$SRC_FILE" | tr -d '\r')
 
 if [ -z "$OUT_NAME" ]; then
     echo "Ошибка: не найден комментарий 'Output: <имя_файла>'." >&2
     exit 2
 fi
 
-# 2. Создаем временный каталог для сборки
+# 2. Идеальная ловушка: ставим trap ДО создания папки
+TMP_DIR=""
+cleanup_handler() {
+    rc=$?
+    trap - EXIT
+    # Удаляем, только если папка успела создаться
+    if [ -n "$TMP_DIR" ] && [ -d "$TMP_DIR" ]; then
+        rm -rf "$TMP_DIR"
+    fi
+    exit $rc
+}
+trap cleanup_handler EXIT HUP INT QUIT PIPE TERM
+
+# Теперь безопасно создаем временный каталог
 TMP_DIR=$(mktemp -d)
 if [ -z "$TMP_DIR" ]; then
     echo "Ошибка: не удалось создать временный каталог." >&2
     exit 3
 fi
 
-# 3. Настраиваем trap, чтобы временная папка удалялась при любом исходе (включая Ctrl+C)
-cleanup_handler() {
-    rc=$?
-    trap - EXIT
-    rm -rf "$TMP_DIR"
-    exit $rc
-}
-trap cleanup_handler EXIT HUP INT QUIT PIPE TERM
-
-# 4. Подготовка к сборке
+# 3. Подготовка к сборке
 SRC_BASE="${SRC_FILE##*/}" 
-
-# Получаем абсолютный путь к папке с исходником для возврата результата
 SRC_DIR=$(cd "$(dirname "$SRC_FILE")" && pwd)
 
 cp "$SRC_FILE" "$TMP_DIR/"
@@ -51,7 +53,7 @@ EXT="${SRC_BASE##*.}"
 
 echo "Сборка $SRC_BASE..."
 
-# 5. Компиляция в зависимости от расширения
+# 4. Компиляция
 case "$EXT" in
     c)
         gcc -Wall -O2 "$SRC_BASE" -o "$OUT_NAME"
@@ -71,7 +73,7 @@ case "$EXT" in
         ;;
 esac
 
-# 6. Проверка результата
+# 5. Проверка результата
 if [ "$BUILD_RC" -ne 0 ]; then
     echo "Ошибка компиляции (код $BUILD_RC)." >&2
     exit "$BUILD_RC"
