@@ -1,7 +1,18 @@
 #!/bin/sh
 
-DIR=/data
+DIR="${DATA_DIR:-/data}"
 LOCK="$DIR/.lock"
+
+# проверка окружения
+if ! command -v flock >/dev/null 2>&1; then
+    echo "flock is not installed" >&2
+    exit 1
+fi
+
+if [ ! -d "$DIR" ] || [ ! -w "$DIR" ]; then
+    echo "shared directory $DIR is not available" >&2
+    exit 1
+fi
 
 # случайный идентификатор контейнера (один на весь запуск)
 ID=$(od -An -N4 -tx1 /dev/urandom | tr -d ' \n')
@@ -21,6 +32,11 @@ while true; do
         echo "$ID $COUNT" > "$DIR/$NAME"
         echo "$NAME"
     ) 9>"$LOCK"
+
+    if [ -z "$NAME" ]; then
+        echo "failed to create file in $DIR" >&2
+        exit 1
+    fi
 
     sleep 1
     rm -f "$DIR/$NAME"
