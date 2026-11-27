@@ -30,19 +30,33 @@ static bool sha1File(const std::string& path, std::string& hash)
     }
 
     EVP_MD_CTX* ctx = EVP_MD_CTX_new();
-    EVP_DigestInit_ex(ctx, EVP_sha1(), nullptr);
+    if (!ctx || EVP_DigestInit_ex(ctx, EVP_sha1(), nullptr) != 1) {
+        std::cerr << path << ": SHA1 initialization failed" << std::endl;
+        EVP_MD_CTX_free(ctx);
+        close(fd);
+        return false;
+    }
 
     std::vector<unsigned char> buf(65536);
     ssize_t n;
-    while ((n = read(fd, buf.data(), buf.size())) > 0)
-        EVP_DigestUpdate(ctx, buf.data(), n);
-    bool ok = (n == 0);
-    if (!ok)
+    bool ok = true;
+    while ((n = read(fd, buf.data(), buf.size())) > 0) {
+        if (EVP_DigestUpdate(ctx, buf.data(), n) != 1) {
+            ok = false;
+            break;
+        }
+    }
+    if (n < 0) {
         std::cerr << path << ": " << strerror(errno) << std::endl;
+        ok = false;
+    }
 
     unsigned char md[EVP_MAX_MD_SIZE];
     unsigned int len = 0;
-    EVP_DigestFinal_ex(ctx, md, &len);
+    if (ok && EVP_DigestFinal_ex(ctx, md, &len) != 1)
+        ok = false;
+    if (!ok && n >= 0)
+        std::cerr << path << ": SHA1 computation failed" << std::endl;
     EVP_MD_CTX_free(ctx);
     close(fd);
 
@@ -55,11 +69,16 @@ static bool sha1File(const std::string& path, std::string& hash)
 // ссылка создаётся под временным именем, затем rename() заменяет дубликат
 static bool replaceWithLink(const std::string& orig, const std::string& dup)
 {
-    const std::string tmp = dup + ".tmplink";
-
-    if (link(orig.c_str(), tmp.c_str()) != 0) {
-        std::cerr << "link " << tmp << " -> " << orig << ": " << strerror(errno) << std::endl;
-        return false;
+    // подбираем свободное временное имя: link() не перезаписывает существующие файлы
+    std::string tmp;
+    for (int i = 0; ; i++) {
+        tmp = dup + ".tmplink" + std::to_string(i);
+        if (link(orig.c_str(), tmp.c_str()) == 0)
+            break;
+        if (errno != EEXIST || i >= 1000) {
+            std::cerr << "link " << tmp << " -> " << orig << ": " << strerror(errno) << std::endl;
+            return false;
+        }
     }
     if (rename(tmp.c_str(), dup.c_str()) != 0) {
         std::cerr << "rename " << tmp << " -> " << dup << ": " << strerror(errno) << std::endl;
@@ -107,33 +126,28 @@ int main(int argc, char* argv[])
     }
 
     // 2. Вычисление SHA1 для каждого файла;
-    //    файлы с одинаковым хэшем попадают в одну группу
-    std::map<std::string, std::vector<FileEntry>> groups;
+    //    файлы с одинаковым хэшем на одном устройстве попадают в одну группу
+    //    (жёсткую ссылку нельзя создать в другой файловой системе)
+    std::map<std::pair<dev_t, std::string>, std::vector<FileEntry>> groups;
     size_t hashed = 0;
     for (auto& f : files) {
         if (!sha1File(f.path, f.hash)) {
             errors = true;
             continue;
         }
-        groups[f.hash].push_back(f);
+        groups[{f.dev, f.hash}].push_back(f);
         hashed++;
     }
 
     // 3. В каждой группе оставляем первый файл, остальные заменяем жёсткими ссылками на него
     size_t linked = 0;
-    for (const auto& [hash, group] : groups) {
+    for (const auto& [key, group] : groups) {
         const FileEntry& orig = group[0];
         for (size_t i = 1; i < group.size(); i++) {
             const FileEntry& dup = group[i];
 
-            if (dup.dev == orig.dev && dup.ino == orig.ino)
+            if (dup.ino == orig.ino)
                 continue; // уже жёсткая ссылка на тот же inode
-
-            if (dup.dev != orig.dev) {
-                // жёсткую ссылку нельзя создать в другой файловой системе
-                std::cerr << "skip " << dup.path << ": different file system" << std::endl;
-                continue;
-            }
 
             if (replaceWithLink(orig.path, dup.path)) {
                 std::cout << dup.path << " -> " << orig.path << std::endl;
